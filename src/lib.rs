@@ -1,14 +1,17 @@
 use std::{
     error::Error,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6}, sync::Arc, ops::DerefMut,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
 };
 
 use tokio::{
-    io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, self},
+    io::{self, split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
     net::TcpStream,
 };
 
-pub async fn handler<'a >(src_stream: TcpStream, _src_socket: SocketAddr) -> Result<(), Box<dyn Error>> {
+pub async fn handler<'a>(
+    src_stream: TcpStream,
+    _src_socket: SocketAddr,
+) -> Result<(), Box<dyn Error>> {
     let (mut src_read, mut src_write) = split(src_stream);
 
     // 进行协议握手
@@ -17,7 +20,13 @@ pub async fn handler<'a >(src_stream: TcpStream, _src_socket: SocketAddr) -> Res
     // 握手完毕开始解析内容
     let req = parse_protocol(&mut src_read, &mut src_write).await?;
 
-    let _ = create_link(req, &mut src_read, &mut src_write).await?;
+    let (mut dst_read, mut dst_write) = create_link(req, &mut src_read, &mut src_write).await?;
+
+    tokio::spawn(async move {
+        let _ = io::copy(&mut src_read, &mut dst_write).await;
+    });
+
+    let _ = io::copy(&mut dst_read, &mut src_write).await?;
 
     Ok(())
 }
@@ -64,14 +73,15 @@ async fn parse_protocol<'a>(
 }
 
 async fn create_link<'a>(
-    mut req: Request<'static>,
-    src_read: &'static mut ReadHalf<TcpStream>,
-    src_write: &'static mut WriteHalf<TcpStream>,
-) -> Result<(), Box<dyn Error>> {
+    req: Request<'a>,
+    _src_read: &'a mut ReadHalf<TcpStream>,
+    src_write: &'a mut WriteHalf<TcpStream>,
+) -> Result<(ReadHalf<TcpStream>, WriteHalf<TcpStream>), Box<dyn Error>> {
     // 根据不同的类型建立链接
     let mut atype = req.address_type;
-    let mut address = req.address;
-    let port = (req.port).read_u16().await?;
+    let address = req.address;
+    let port_mut = req.port;
+    let port = (port_mut.clone()).read_u16().await?;
 
     let dst_stream = match atype.get(0) {
         Some(0x01_u8) => {
@@ -82,11 +92,15 @@ async fn create_link<'a>(
             TcpStream::connect(socket).await?
         }
         Some(0x03_u8) => {
-            let socket = SocketAddrV4::new(
-                Ipv4Addr::new(address[0], address[1], address[2], address[3]),
-                port,
-            );
-            TcpStream::connect(socket).await?
+            // let socket = SocketAddr::new(
+            //     address,
+            //     port,
+            // );
+            let address = &address[1..];
+            let address = String::from_utf8_lossy(address).to_string();
+            let host = format!("{}:{}", address, port);
+
+            TcpStream::connect(&host).await?
         }
         Some(0x04_u8) => {
             let address_a = (&address[0..2]).read_u16().await?;
@@ -113,40 +127,37 @@ async fn create_link<'a>(
             return Err("sss".into());
         }
         None => {
-            return Ok(());
+            return Err("sss".into());
         }
     };
 
-    let (mut dst_read, mut dst_write) = split(dst_stream);
+    let (dst_read, dst_write) = split(dst_stream);
+
+    let lent = address.len() + 6;
+
+    let mut buffer = Vec::with_capacity(lent);
 
 
-    let mut connect_buffer = [0x00_u8; 4];
+    buffer.insert(0, 0x05);
+    buffer.insert(1, 0x00);
+    buffer.insert(2, 0x00);
+    buffer.insert(3, atype.read_u8().await?);
 
-    connect_buffer[0] = 0x05;
-    connect_buffer[1] = 0x00;
-    connect_buffer[2] = 0x01;
-    connect_buffer[3] = atype.read_u8().await?;
+    let mut i = 3;
+    for ele in address {
+        i = i + 1;
+        buffer.insert(i, *ele)
+    }
 
-    src_write.write(&mut connect_buffer).await?;
-    src_write.write(&mut address).await?;
-    src_write.write(req.port).await?;
+    for ele in port_mut {
+        i = i + 1;
+        buffer.insert(i, *ele);
+    }
+
+    src_write.write(&buffer).await?;
     src_write.flush().await?;
 
-    // let src_read = Arc::new(src_read);
-    // let src_read = Arc::clone(&src_read);
-
-    // let a: ReadHalf<TcpStream> = src_read.into();
-
-    drop(req);
-
-    tokio::spawn( async move {
-        let _ = io::copy(src_read, &mut dst_write).await;
-    }).await;
-
-    io::copy(&mut dst_read, src_write).await?;
-
-
-    Ok(())
+    Ok((dst_read, dst_write))
 }
 
 struct Request<'a> {
