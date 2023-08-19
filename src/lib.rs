@@ -80,8 +80,8 @@ async fn create_link<'a>(
     // 根据不同的类型建立链接
     let mut atype = req.address_type;
     let address = req.address;
-    let port_mut = req.port;
-    let port = (port_mut.clone()).read_u16().await?;
+    let mut port_mut = req.port;
+    let port = port_mut.read_u16().await?;
 
     let dst_stream = match atype.get(0) {
         Some(0x01_u8) => {
@@ -136,7 +136,6 @@ async fn create_link<'a>(
     let lent = address.len() + 6;
 
     let mut buffer = Vec::with_capacity(lent);
-
 
     buffer.insert(0, 0x05);
     buffer.insert(1, 0x00);
